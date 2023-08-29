@@ -1549,9 +1549,9 @@ func (sp *ServiceProvider) ValidateLogoutRequestRedirect(queryParameterData stri
 		return retErr
 	}
 
-	if err := sp.validateSignature(doc.Root()); err != nil {
-		retErr.PrivateErr = err
-		return retErr
+	responseSignatureErr := sp.validateSignature(doc.Root())
+	if responseSignatureErr != errSignatureElementNotPresent {
+		// TODO if signature is required...
 	}
 
 	var req LogoutRequest
