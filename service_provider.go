@@ -12,7 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"html/template"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -647,7 +647,7 @@ func (sp *ServiceProvider) handleArtifactRequest(ctx context.Context, artifactID
 		retErr.PrivateErr = fmt.Errorf("Error during artifact resolution: HTTP status %d (%s)", response.StatusCode, response.Status)
 		return nil, retErr
 	}
-	responseBody, err := ioutil.ReadAll(response.Body)
+	responseBody, err := io.ReadAll(response.Body)
 	if err != nil {
 		retErr.PrivateErr = fmt.Errorf("Error during artifact resolution: %s", err)
 		return nil, retErr
@@ -1473,8 +1473,115 @@ func (sp *ServiceProvider) nameIDFormat() string {
 	return nameIDFormat
 }
 
-// ValidateLogoutResponseRequest validates the LogoutResponse content from the request
-func (sp *ServiceProvider) ValidateLogoutResponseRequest(req *http.Request) error {
+func (sp *ServiceProvider) ValidateLogoutRequest(req *http.Request) error {
+	if data := req.URL.Query().Get("SAMLResponse"); data != "" {
+		return sp.ValidateLogoutRequestRedirect(data)
+	}
+
+	err := req.ParseForm()
+	if err != nil {
+		return fmt.Errorf("unable to parse form: %v", err)
+	}
+
+	return sp.ValidateLogoutRequestForm(req.PostForm.Get("SAMLResponse"))
+}
+
+func (sp *ServiceProvider) ValidateLogoutRequestForm(postFormData string) error {
+	retErr := &InvalidResponseError{
+		Now: TimeNow(),
+	}
+
+	rawResponseBuf, err := base64.StdEncoding.DecodeString(postFormData)
+	if err != nil {
+		retErr.PrivateErr = fmt.Errorf("unable to parse base64: %s", err)
+		return retErr
+	}
+	retErr.Response = string(rawResponseBuf)
+
+	if err := xrv.Validate(bytes.NewReader(rawResponseBuf)); err != nil {
+		return fmt.Errorf("response contains invalid XML: %s", err)
+	}
+
+	doc := etree.NewDocument()
+	if err := doc.ReadFromBytes(rawResponseBuf); err != nil {
+		retErr.PrivateErr = err
+		return retErr
+	}
+
+	if err := sp.validateSignature(doc.Root()); err != nil {
+		retErr.PrivateErr = err
+		return retErr
+	}
+
+	var req LogoutRequest
+	if err := unmarshalElement(doc.Root(), &req); err != nil {
+		retErr.PrivateErr = err
+		return retErr
+	}
+	return sp.validateLogoutRequest(&req)
+}
+
+func (sp *ServiceProvider) ValidateLogoutRequestRedirect(queryParameterData string) error {
+	retErr := &InvalidResponseError{
+		Now: TimeNow(),
+	}
+
+	rawResponseBuf, err := base64.StdEncoding.DecodeString(queryParameterData)
+	if err != nil {
+		retErr.PrivateErr = fmt.Errorf("unable to parse base64: %s", err)
+		return retErr
+	}
+	retErr.Response = string(rawResponseBuf)
+
+	gr, err := io.ReadAll(newSaferFlateReader(bytes.NewBuffer(rawResponseBuf)))
+	if err != nil {
+		retErr.PrivateErr = err
+		return retErr
+	}
+
+	if err := xrv.Validate(bytes.NewReader(gr)); err != nil {
+		return err
+	}
+
+	doc := etree.NewDocument()
+	if err := doc.ReadFromBytes(rawResponseBuf); err != nil {
+		retErr.PrivateErr = err
+		return retErr
+	}
+
+	if err := sp.validateSignature(doc.Root()); err != nil {
+		retErr.PrivateErr = err
+		return retErr
+	}
+
+	var req LogoutRequest
+	if err := unmarshalElement(doc.Root(), &req); err != nil {
+		retErr.PrivateErr = err
+		return retErr
+	}
+	return sp.validateLogoutRequest(&req)
+}
+
+func (sp *ServiceProvider) validateLogoutRequest(req *LogoutRequest) error {
+	if req.Destination != sp.SloURL.String() {
+		return fmt.Errorf("`Destination` does not match SloURL (expected %q)", sp.SloURL.String())
+	}
+
+	now := time.Now()
+	if req.IssueInstant.Add(MaxIssueDelay).Before(now) {
+		return fmt.Errorf("issueInstant expired at %s", req.IssueInstant.Add(MaxIssueDelay))
+	}
+	if req.Issuer.Value != sp.IDPMetadata.EntityID {
+		return fmt.Errorf("issuer does not match the IDP metadata (expected %q)", sp.IDPMetadata.EntityID)
+	}
+
+	// TODO validate accordingly
+
+	return nil
+}
+
+// ValidateLogoutResponse validates the LogoutResponse content from the request
+func (sp *ServiceProvider) ValidateLogoutResponse(req *http.Request) error {
 	if data := req.URL.Query().Get("SAMLResponse"); data != "" {
 		return sp.ValidateLogoutResponseRedirect(data)
 	}
@@ -1540,7 +1647,7 @@ func (sp *ServiceProvider) ValidateLogoutResponseRedirect(queryParameterData str
 	}
 	retErr.Response = string(rawResponseBuf)
 
-	gr, err := ioutil.ReadAll(newSaferFlateReader(bytes.NewBuffer(rawResponseBuf)))
+	gr, err := io.ReadAll(newSaferFlateReader(bytes.NewBuffer(rawResponseBuf)))
 	if err != nil {
 		retErr.PrivateErr = err
 		return retErr
