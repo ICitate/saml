@@ -1473,20 +1473,20 @@ func (sp *ServiceProvider) nameIDFormat() string {
 	return nameIDFormat
 }
 
-func (sp *ServiceProvider) ValidateLogoutRequest(req *http.Request) error {
+func (sp *ServiceProvider) ValidateLogoutRequest(req *http.Request) (*LogoutRequest, error) {
 	if data := req.URL.Query().Get("SAMLRequest"); data != "" {
 		return sp.ValidateLogoutRequestRedirect(data)
 	}
 
 	err := req.ParseForm()
 	if err != nil {
-		return fmt.Errorf("unable to parse form: %v", err)
+		return nil, fmt.Errorf("unable to parse form: %v", err)
 	}
 
 	return sp.ValidateLogoutRequestForm(req.PostForm.Get("SAMLResponse"))
 }
 
-func (sp *ServiceProvider) ValidateLogoutRequestForm(postFormData string) error {
+func (sp *ServiceProvider) ValidateLogoutRequestForm(postFormData string) (*LogoutRequest, error) {
 	retErr := &InvalidResponseError{
 		Now: TimeNow(),
 	}
@@ -1494,34 +1494,34 @@ func (sp *ServiceProvider) ValidateLogoutRequestForm(postFormData string) error 
 	rawResponseBuf, err := base64.StdEncoding.DecodeString(postFormData)
 	if err != nil {
 		retErr.PrivateErr = fmt.Errorf("unable to parse base64: %s", err)
-		return retErr
+		return nil, retErr
 	}
 	retErr.Response = string(rawResponseBuf)
 
 	if err := xrv.Validate(bytes.NewReader(rawResponseBuf)); err != nil {
-		return fmt.Errorf("response contains invalid XML: %s", err)
+		return nil, fmt.Errorf("response contains invalid XML: %s", err)
 	}
 
 	doc := etree.NewDocument()
 	if err := doc.ReadFromBytes(rawResponseBuf); err != nil {
 		retErr.PrivateErr = err
-		return retErr
+		return nil, retErr
 	}
 
 	if err := sp.validateSignature(doc.Root()); err != nil {
 		retErr.PrivateErr = err
-		return retErr
+		return nil, retErr
 	}
 
 	var req LogoutRequest
 	if err := unmarshalElement(doc.Root(), &req); err != nil {
 		retErr.PrivateErr = err
-		return retErr
+		return nil, retErr
 	}
-	return sp.validateLogoutRequest(&req)
+	return &req, sp.validateLogoutRequest(&req)
 }
 
-func (sp *ServiceProvider) ValidateLogoutRequestRedirect(queryParameterData string) error {
+func (sp *ServiceProvider) ValidateLogoutRequestRedirect(queryParameterData string) (*LogoutRequest, error) {
 	retErr := &InvalidResponseError{
 		Now: TimeNow(),
 	}
@@ -1529,24 +1529,24 @@ func (sp *ServiceProvider) ValidateLogoutRequestRedirect(queryParameterData stri
 	rawResponseBuf, err := base64.StdEncoding.DecodeString(queryParameterData)
 	if err != nil {
 		retErr.PrivateErr = fmt.Errorf("unable to parse base64: %s", err)
-		return retErr
+		return nil, retErr
 	}
 	retErr.Response = string(rawResponseBuf)
 
 	gr, err := io.ReadAll(newSaferFlateReader(bytes.NewBuffer(rawResponseBuf)))
 	if err != nil {
 		retErr.PrivateErr = err
-		return retErr
+		return nil, retErr
 	}
 
 	if err := xrv.Validate(bytes.NewReader(gr)); err != nil {
-		return err
+		return nil, err
 	}
 
 	doc := etree.NewDocument()
 	if err := doc.ReadFromBytes(gr); err != nil {
 		retErr.PrivateErr = err
-		return retErr
+		return nil, retErr
 	}
 
 	responseSignatureErr := sp.validateSignature(doc.Root())
@@ -1557,9 +1557,9 @@ func (sp *ServiceProvider) ValidateLogoutRequestRedirect(queryParameterData stri
 	var req LogoutRequest
 	if err := unmarshalElement(doc.Root(), &req); err != nil {
 		retErr.PrivateErr = err
-		return retErr
+		return nil, retErr
 	}
-	return sp.validateLogoutRequest(&req)
+	return &req, sp.validateLogoutRequest(&req)
 }
 
 func (sp *ServiceProvider) validateLogoutRequest(req *LogoutRequest) error {
