@@ -1474,7 +1474,7 @@ func (sp *ServiceProvider) nameIDFormat() string {
 }
 
 func (sp *ServiceProvider) ValidateLogoutRequest(req *http.Request) error {
-	if data := req.URL.Query().Get("SAMLResponse"); data != "" {
+	if data := req.URL.Query().Get("SAMLRequest"); data != "" {
 		return sp.ValidateLogoutRequestRedirect(data)
 	}
 
