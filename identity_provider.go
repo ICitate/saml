@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -21,6 +22,7 @@ import (
 	"github.com/beevik/etree"
 	xrv "github.com/mattermost/xml-roundtrip-validator"
 	dsig "github.com/russellhaering/goxmldsig"
+	"github.com/russellhaering/goxmldsig/etreeutils"
 
 	"github.com/crewjam/saml/logger"
 	"github.com/crewjam/saml/xmlenc"
@@ -1093,4 +1095,340 @@ func (req *IdpAuthnRequest) signingContext() (*dsig.SigningContext, error) {
 	}
 
 	return signingContext, nil
+}
+
+func (idp *IdentityProvider) ValidateLogoutRequest(req *http.Request) (*LogoutRequest, error) {
+	if data := req.URL.Query().Get("SAMLRequest"); data != "" {
+		return idp.ValidateLogoutRequestRedirect(data)
+	}
+
+	err := req.ParseForm()
+	if err != nil {
+		return nil, fmt.Errorf("unable to parse form: %v", err)
+	}
+
+	return idp.ValidateLogoutRequestForm(req.PostForm.Get("SAMLResponse"))
+}
+
+func (idp *IdentityProvider) ValidateLogoutRequestForm(postFormData string) (*LogoutRequest, error) {
+	retErr := &InvalidResponseError{
+		Now: TimeNow(),
+	}
+
+	rawResponseBuf, err := base64.StdEncoding.DecodeString(postFormData)
+	if err != nil {
+		retErr.PrivateErr = fmt.Errorf("unable to parse base64: %s", err)
+		return nil, retErr
+	}
+	retErr.Response = string(rawResponseBuf)
+
+	if err := xrv.Validate(bytes.NewReader(rawResponseBuf)); err != nil {
+		return nil, fmt.Errorf("response contains invalid XML: %s", err)
+	}
+
+	doc := etree.NewDocument()
+	if err := doc.ReadFromBytes(rawResponseBuf); err != nil {
+		retErr.PrivateErr = err
+		return nil, retErr
+	}
+
+	if err := idp.validateSignature(doc.Root()); err != nil {
+		retErr.PrivateErr = err
+		return nil, retErr
+	}
+
+	var req LogoutRequest
+	if err := unmarshalElement(doc.Root(), &req); err != nil {
+		retErr.PrivateErr = err
+		return nil, retErr
+	}
+	return &req, idp.validateLogoutRequest(&req)
+}
+
+func (idp *IdentityProvider) ValidateLogoutRequestRedirect(queryParameterData string) (*LogoutRequest, error) {
+	retErr := &InvalidResponseError{
+		Now: TimeNow(),
+	}
+
+	rawResponseBuf, err := base64.StdEncoding.DecodeString(queryParameterData)
+	if err != nil {
+		retErr.PrivateErr = fmt.Errorf("unable to parse base64: %s", err)
+		return nil, retErr
+	}
+	retErr.Response = string(rawResponseBuf)
+
+	gr, err := io.ReadAll(newSaferFlateReader(bytes.NewBuffer(rawResponseBuf)))
+	if err != nil {
+		retErr.PrivateErr = err
+		return nil, retErr
+	}
+
+	if err := xrv.Validate(bytes.NewReader(gr)); err != nil {
+		return nil, err
+	}
+
+	doc := etree.NewDocument()
+	if err := doc.ReadFromBytes(gr); err != nil {
+		retErr.PrivateErr = err
+		return nil, retErr
+	}
+
+	responseSignatureErr := idp.validateSignature(doc.Root())
+	if responseSignatureErr != errSignatureElementNotPresent {
+		// TODO if signature is required...
+	}
+
+	var req LogoutRequest
+	if err := unmarshalElement(doc.Root(), &req); err != nil {
+		retErr.PrivateErr = err
+		return nil, retErr
+	}
+	return &req, idp.validateLogoutRequest(&req)
+}
+
+func (idp *IdentityProvider) validateLogoutRequest(req *LogoutRequest) error {
+	if req.Destination != idp.LogoutURL.String() {
+		return fmt.Errorf("`Destination` does not match SloURL (expected %q)", idp.LogoutURL.String())
+	}
+
+	now := time.Now()
+	if req.IssueInstant.Add(MaxIssueDelay).Before(now) {
+		return fmt.Errorf("issueInstant expired at %s", req.IssueInstant.Add(MaxIssueDelay))
+	}
+	if req.Issuer.Value != idp.Metadata().EntityID {
+		return fmt.Errorf("issuer does not match the IDP metadata (expected %q)", idp.Metadata().EntityID)
+	}
+
+	// TODO validate accordingly
+
+	return nil
+}
+
+// ValidateLogoutResponse validates the LogoutResponse content from the request
+func (idp *IdentityProvider) ValidateLogoutResponse(req *http.Request) error {
+	if data := req.URL.Query().Get("SAMLResponse"); data != "" {
+		return idp.ValidateLogoutResponseRedirect(data)
+	}
+
+	err := req.ParseForm()
+	if err != nil {
+		return fmt.Errorf("unable to parse form: %v", err)
+	}
+
+	return idp.ValidateLogoutResponseForm(req.PostForm.Get("SAMLResponse"))
+}
+
+// ValidateLogoutResponseForm returns a nil error if the logout response is valid.
+func (idp *IdentityProvider) ValidateLogoutResponseForm(postFormData string) error {
+	retErr := &InvalidResponseError{
+		Now: TimeNow(),
+	}
+
+	rawResponseBuf, err := base64.StdEncoding.DecodeString(postFormData)
+	if err != nil {
+		retErr.PrivateErr = fmt.Errorf("unable to parse base64: %s", err)
+		return retErr
+	}
+	retErr.Response = string(rawResponseBuf)
+
+	// TODO(ross): add test case for this (SLO does not have tests right now)
+	if err := xrv.Validate(bytes.NewReader(rawResponseBuf)); err != nil {
+		return fmt.Errorf("response contains invalid XML: %s", err)
+	}
+
+	doc := etree.NewDocument()
+	if err := doc.ReadFromBytes(rawResponseBuf); err != nil {
+		retErr.PrivateErr = err
+		return retErr
+	}
+
+	if err := idp.validateSignature(doc.Root()); err != nil {
+		retErr.PrivateErr = err
+		return retErr
+	}
+
+	var resp LogoutResponse
+	if err := unmarshalElement(doc.Root(), &resp); err != nil {
+		retErr.PrivateErr = err
+		return retErr
+	}
+	return idp.validateLogoutResponse(&resp)
+}
+
+// ValidateLogoutResponseRedirect returns a nil error if the logout response is valid.
+//
+// URL Binding appears to be gzip / flate encoded
+// See https://www.oasis-open.org/committees/download.php/20645/sstc-saml-tech-overview-2%200-draft-10.pdf  6.6
+func (idp *IdentityProvider) ValidateLogoutResponseRedirect(queryParameterData string) error {
+	retErr := &InvalidResponseError{
+		Now: TimeNow(),
+	}
+
+	rawResponseBuf, err := base64.StdEncoding.DecodeString(queryParameterData)
+	if err != nil {
+		retErr.PrivateErr = fmt.Errorf("unable to parse base64: %s", err)
+		return retErr
+	}
+	retErr.Response = string(rawResponseBuf)
+
+	gr, err := io.ReadAll(newSaferFlateReader(bytes.NewBuffer(rawResponseBuf)))
+	if err != nil {
+		retErr.PrivateErr = err
+		return retErr
+	}
+
+	if err := xrv.Validate(bytes.NewReader(gr)); err != nil {
+		return err
+	}
+
+	doc := etree.NewDocument()
+	if err := doc.ReadFromBytes(rawResponseBuf); err != nil {
+		retErr.PrivateErr = err
+		return retErr
+	}
+
+	if err := idp.validateSignature(doc.Root()); err != nil {
+		retErr.PrivateErr = err
+		return retErr
+	}
+
+	var resp LogoutResponse
+	if err := unmarshalElement(doc.Root(), &resp); err != nil {
+		retErr.PrivateErr = err
+		return retErr
+	}
+	return idp.validateLogoutResponse(&resp)
+}
+
+// validateLogoutResponse validates the LogoutResponse fields. Returns a nil error if the LogoutResponse is valid.
+func (idp *IdentityProvider) validateLogoutResponse(resp *LogoutResponse) error {
+	if resp.Destination != idp.LogoutURL.String() {
+		return fmt.Errorf("`Destination` does not match LogoutURL (expected %q)", idp.LogoutURL.String())
+	}
+
+	now := time.Now()
+	if resp.IssueInstant.Add(MaxIssueDelay).Before(now) {
+		return fmt.Errorf("issueInstant expired at %s", resp.IssueInstant.Add(MaxIssueDelay))
+	}
+	if resp.Issuer.Value != idp.Metadata().EntityID {
+		return fmt.Errorf("issuer does not match the IDP metadata (expected %q)", idp.Metadata().EntityID)
+	}
+	if resp.Status.StatusCode.Value != StatusSuccess {
+		return fmt.Errorf("status code was not %s", StatusSuccess)
+	}
+
+	return nil
+}
+
+// validateSignature returns nil iff the Signature embedded in the element is valid
+func (idp *IdentityProvider) validateSignature(el *etree.Element) error {
+	sigEl, err := findChild(el, "http://www.w3.org/2000/09/xmldsig#", "Signature")
+	if err != nil {
+		return err
+	}
+	if sigEl == nil {
+		return errSignatureElementNotPresent
+	}
+
+	certs, err := idp.getIDPSigningCerts()
+	if err != nil {
+		return fmt.Errorf("cannot validate signature on %s: %v", el.Tag, err)
+	}
+
+	certificateStore := dsig.MemoryX509CertificateStore{
+		Roots: certs,
+	}
+
+	validationContext := dsig.NewDefaultValidationContext(&certificateStore)
+	validationContext.IdAttribute = "ID"
+	if Clock != nil {
+		validationContext.Clock = Clock
+	}
+
+	// Some SAML responses contain a RSAKeyValue element. One of two things is happening here:
+	//
+	// (1) We're getting something signed by a key we already know about -- the public key
+	//     of the signing cert provided in the metadata.
+	// (2) We're getting something signed by a key we *don't* know about, and which we have
+	//     no ability to verify.
+	//
+	// The best course of action is to just remove the KeyInfo so that dsig falls back to
+	// verifying against the public key provided in the metadata.
+	if el.FindElement("./Signature/KeyInfo/X509Data/X509Certificate") == nil {
+		if sigEl := el.FindElement("./Signature"); sigEl != nil {
+			if keyInfo := sigEl.FindElement("KeyInfo"); keyInfo != nil {
+				sigEl.RemoveChild(keyInfo)
+			}
+		}
+	}
+
+	ctx, err := etreeutils.NSBuildParentContext(el)
+	if err != nil {
+		return fmt.Errorf("cannot validate signature on %s: %v", el.Tag, err)
+	}
+	ctx, err = ctx.SubContext(el)
+	if err != nil {
+		return fmt.Errorf("cannot validate signature on %s: %v", el.Tag, err)
+	}
+	el, err = etreeutils.NSDetatch(ctx, el)
+	if err != nil {
+		return fmt.Errorf("cannot validate signature on %s: %v", el.Tag, err)
+	}
+
+	/* not supported yet
+	if idp.SignatureVerifier != nil {
+		return idp.SignatureVerifier.VerifySignature(validationContext, el)
+	}
+
+	if _, err := validationContext.Validate(el); err != nil {
+		return fmt.Errorf("cannot validate signature on %s: %v", el.Tag, err)
+	}
+	*/
+
+	return nil
+}
+
+// getIDPSigningCerts returns the certificates which we can use to verify things
+// signed by the IDP in PEM format, or nil if no such certificate is found.
+func (idp *IdentityProvider) getIDPSigningCerts() ([]*x509.Certificate, error) {
+	var certStrs []string
+
+	// We need to include non-empty certs where the "use" attribute is
+	// either set to "signing" or is missing
+	for _, idpSSODescriptor := range idp.Metadata().IDPSSODescriptors {
+		for _, keyDescriptor := range idpSSODescriptor.KeyDescriptors {
+			if len(keyDescriptor.KeyInfo.X509Data.X509Certificates) != 0 {
+				switch keyDescriptor.Use {
+				case "", "signing":
+					for _, certificate := range keyDescriptor.KeyInfo.X509Data.X509Certificates {
+						certStrs = append(certStrs, certificate.Data)
+					}
+				}
+			}
+		}
+	}
+
+	if len(certStrs) == 0 {
+		return nil, errors.New("cannot find any signing certificate in the IDP SSO descriptor")
+	}
+
+	certs := make([]*x509.Certificate, len(certStrs))
+
+	// cleanup whitespace
+	regex := regexp.MustCompile(`\s+`)
+	for i, certStr := range certStrs {
+		certStr = regex.ReplaceAllString(certStr, "")
+		certBytes, err := base64.StdEncoding.DecodeString(certStr)
+		if err != nil {
+			return nil, fmt.Errorf("cannot parse certificate: %s", err)
+		}
+
+		parsedCert, err := x509.ParseCertificate(certBytes)
+		if err != nil {
+			return nil, err
+		}
+		certs[i] = parsedCert
+	}
+
+	return certs, nil
 }
